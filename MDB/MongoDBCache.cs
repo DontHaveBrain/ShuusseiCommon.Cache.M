@@ -19,21 +19,27 @@ namespace ShuseiCommon.Common.MDB
         private readonly Lazy<MongoClient> _clientLazy;
         private readonly ConcurrentDictionary<string, IMongoDatabase> _dbCache = new();
         private readonly ConcurrentDictionary<string, object> _collectionCache = new();
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _indexLocks = new();
         private readonly ConcurrentDictionary<string, bool> _indexCache = new();
         private readonly ConcurrentDictionary<Type, MongoTypeMetadata> _metadataCache = new();
+
+        // 可配置的批量操作大小
+        private readonly int _batchSize;
 
         public MongoDBCache(IConfiguration configuration)
         {
             _connStr = configuration.GetConnectionString("mongoDB")!;
             _dbName = configuration.GetConnectionString("DBName")!;
             _clientLazy = new Lazy<MongoClient>(() => CreateClient(_connStr));
+            _batchSize = configuration.GetValue("MongoDB:BatchSize", 1000);
         }
 
-        public MongoDBCache(string connectionString, string dbName)
+        public MongoDBCache(string connectionString, string dbName, int batchSize = 1000)
         {
             _connStr = connectionString;
             _dbName = dbName;
             _clientLazy = new Lazy<MongoClient>(() => CreateClient(_connStr));
+            _batchSize = batchSize;
         }
 
         private static MongoClient CreateClient(string connStr)
@@ -115,58 +121,85 @@ namespace ShuseiCommon.Common.MDB
 
             return (IMongoCollection<T>)_collectionCache.GetOrAdd(key, _ =>
             {
-                var collection = GetDatabase(db).GetCollection<T>(col);
-                EnsureIndexesAsync<T>(collection, key, metadata).ConfigureAwait(false).GetAwaiter().GetResult();
-                return collection;
+                return GetDatabase(db).GetCollection<T>(col);
             });
+        }
+
+        private async Task<IMongoCollection<T>> GetCollectionAsync<T>(string? dbName = null, string? collectionName = null)
+        {
+            var metadata = GetMetadata<T>();
+            var db = dbName ?? metadata.DatabaseName ?? _dbName;
+            var col = collectionName ?? metadata.CollectionName ?? typeof(T).Name;
+            var key = $"{db}.{col}";
+
+            var collection = (IMongoCollection<T>)_collectionCache.GetOrAdd(key, _ =>
+            {
+                return GetDatabase(db).GetCollection<T>(col);
+            });
+
+            await EnsureIndexesAsync(collection, key, metadata);
+            return collection;
         }
 
         private async Task EnsureIndexesAsync<T>(IMongoCollection<T> collection, string cacheKey, MongoTypeMetadata metadata)
         {
             if (_indexCache.ContainsKey(cacheKey)) return;
 
-            var indexes = new List<CreateIndexModel<T>>();
-
-            // 主键索引
-            if (metadata.KeyProperty != null && metadata.KeyAttribute?.AutoIndex == true)
-            {
-                indexes.Add(new CreateIndexModel<T>(
-                    Builders<T>.IndexKeys.Ascending(metadata.KeyProperty.Name),
-                    new CreateIndexOptions
-                    {
-                        Background = true,
-                        Unique = metadata.KeyAttribute.Unique,
-                        Sparse = true
-                    }));
-            }
-
-            // 标记了 MongoIndexAttribute 的字段
-            foreach (var (prop, attr) in metadata.IndexedProperties)
-            {
-                var keys = attr.Descending
-                    ? Builders<T>.IndexKeys.Descending(prop.Name)
-                    : Builders<T>.IndexKeys.Ascending(prop.Name);
-
-                indexes.Add(new CreateIndexModel<T>(keys, new CreateIndexOptions
-                {
-                    Background = true,
-                    Unique = attr.Unique,
-                    Sparse = attr.Sparse
-                }));
-            }
-
-            if (indexes.Count == 0) 
-            {
-                _indexCache[cacheKey] = true;
-                return;
-            }
-
+            // 使用 SemaphoreSlim 避免并发创建索引
+            var indexLock = _indexLocks.GetOrAdd(cacheKey, _ => new SemaphoreSlim(1, 1));
+            await indexLock.WaitAsync();
             try
             {
+                if (_indexCache.ContainsKey(cacheKey)) return;
+
+                var indexes = new List<CreateIndexModel<T>>();
+
+                // 主键索引
+                if (metadata.KeyProperty != null && metadata.KeyAttribute?.AutoIndex == true)
+                {
+                    indexes.Add(new CreateIndexModel<T>(
+                        Builders<T>.IndexKeys.Ascending(metadata.KeyProperty.Name),
+                        new CreateIndexOptions
+                        {
+                            Background = true,
+                            Unique = metadata.KeyAttribute.Unique,
+                            Sparse = true
+                        }));
+                }
+
+                // 标记了 MongoIndexAttribute 的字段
+                foreach (var (prop, attr) in metadata.IndexedProperties)
+                {
+                    var keys = attr.Descending
+                        ? Builders<T>.IndexKeys.Descending(prop.Name)
+                        : Builders<T>.IndexKeys.Ascending(prop.Name);
+
+                    indexes.Add(new CreateIndexModel<T>(keys, new CreateIndexOptions
+                    {
+                        Background = true,
+                        Unique = attr.Unique,
+                        Sparse = attr.Sparse
+                    }));
+                }
+
+                if (indexes.Count == 0)
+                {
+                    _indexCache[cacheKey] = true;
+                    return;
+                }
+
                 await collection.Indexes.CreateManyAsync(indexes);
                 _indexCache[cacheKey] = true;
             }
-            catch { _indexCache[cacheKey] = true; }
+            catch (MongoCommandException)
+            {
+                // 索引已存在，标记为完成
+                _indexCache[cacheKey] = true;
+            }
+            finally
+            {
+                indexLock.Release();
+            }
         }
         #endregion
 
@@ -195,8 +228,21 @@ namespace ShuseiCommon.Common.MDB
         {
             try
             {
-                await GetCollection<T>(dbName, collectionName).InsertOneAsync(data);
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                await collection.InsertOneAsync(data);
                 return Result<int>.Success(1);
+            }
+            catch (MongoWriteException ex) when (ex.WriteError.Category == ServerErrorCategory.DuplicateKey)
+            {
+                return Result<int>.Fail($"Insert failed: Duplicate key - {ex.WriteError.Message}");
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<int>.Fail($"Insert failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<int>.Fail($"Insert failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -211,25 +257,36 @@ namespace ShuseiCommon.Common.MDB
 
             try
             {
-                var collection = GetCollection<T>(dbName, collectionName);
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
 
-                if (data.Count <= 1000)
+                if (data.Count <= _batchSize)
                 {
                     await collection.InsertManyAsync(data, new InsertManyOptions { IsOrdered = false });
                 }
                 else
                 {
-                    const int batchSize = 1000;
                     var tasks = new List<Task>();
-                    for (int i = 0; i < data.Count; i += batchSize)
+                    for (int i = 0; i < data.Count; i += _batchSize)
                     {
-                        var batch = data.Skip(i).Take(batchSize).ToList();
+                        var batch = data.Skip(i).Take(_batchSize).ToList();
                         tasks.Add(collection.InsertManyAsync(batch, new InsertManyOptions { IsOrdered = false }));
                     }
                     await Task.WhenAll(tasks);
                 }
 
                 return Result<int>.Success(data.Count);
+            }
+            catch (MongoBulkWriteException ex)
+            {
+                return Result<int>.Fail($"Batch insert failed: {ex.WriteErrors.Count} errors - {ex.Message}");
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<int>.Fail($"Batch insert failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<int>.Fail($"Batch insert failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -243,8 +300,17 @@ namespace ShuseiCommon.Common.MDB
         {
             try
             {
-                var result = await GetCollection<T>(dbName, collectionName).DeleteManyAsync(filter);
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection.DeleteManyAsync(filter);
                 return Result<DeleteResult>.Success(result);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<DeleteResult>.Fail($"Delete failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<DeleteResult>.Fail($"Delete failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -257,8 +323,17 @@ namespace ShuseiCommon.Common.MDB
             try
             {
                 var filter = BuildKeyFilter<T, TKey>(key);
-                var result = await GetCollection<T>(dbName, collectionName).DeleteOneAsync(filter);
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection.DeleteOneAsync(filter);
                 return Result<DeleteResult>.Success(result);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<DeleteResult>.Fail($"Delete failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<DeleteResult>.Fail($"Delete failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -273,8 +348,17 @@ namespace ShuseiCommon.Common.MDB
         {
             try
             {
-                var result = await GetCollection<T>(dbName, collectionName).DeleteManyAsync(filter);
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection.DeleteManyAsync(filter);
                 return Result<DeleteResult>.Success(result);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<DeleteResult>.Fail($"Delete failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<DeleteResult>.Fail($"Delete failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -291,8 +375,17 @@ namespace ShuseiCommon.Common.MDB
 
             try
             {
-                var result = await GetCollection<T>(dbName, collectionName).UpdateManyAsync(filter, update);
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection.UpdateManyAsync(filter, update);
                 return Result<UpdateResult>.Success(result);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<UpdateResult>.Fail($"Update failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<UpdateResult>.Fail($"Update failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -304,8 +397,17 @@ namespace ShuseiCommon.Common.MDB
         {
             try
             {
-                var result = await GetCollection<T>(dbName, collectionName).ReplaceOneAsync(filter, replacement, new ReplaceOptions { IsUpsert = false });
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection.ReplaceOneAsync(filter, replacement, new ReplaceOptions { IsUpsert = false });
                 return Result<ReplaceOneResult>.Success(result);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<ReplaceOneResult>.Fail($"Replace failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<ReplaceOneResult>.Fail($"Replace failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -317,8 +419,17 @@ namespace ShuseiCommon.Common.MDB
         {
             try
             {
-                var result = await GetCollection<T>(dbName, collectionName).ReplaceOneAsync(filter, replacement, new ReplaceOptions { IsUpsert = true });
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection.ReplaceOneAsync(filter, replacement, new ReplaceOptions { IsUpsert = true });
                 return Result<ReplaceOneResult>.Success(result);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<ReplaceOneResult>.Fail($"Upsert failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<ReplaceOneResult>.Fail($"Upsert failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -339,8 +450,17 @@ namespace ShuseiCommon.Common.MDB
 
                 var keyField = GetKeyFieldName<T>();
                 var filter = Builders<T>.Filter.Eq(keyField, keyValue);
-                var result = await GetCollection<T>(dbName, collectionName).ReplaceOneAsync(filter, entity, new ReplaceOptions { IsUpsert = true });
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection.ReplaceOneAsync(filter, entity, new ReplaceOptions { IsUpsert = true });
                 return Result<ReplaceOneResult>.Success(result);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<ReplaceOneResult>.Fail($"Save failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<ReplaceOneResult>.Fail($"Save failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -355,7 +475,8 @@ namespace ShuseiCommon.Common.MDB
             try
             {
                 var filter = BuildKeyFilter<T, TKey>(key);
-                var result = await GetCollection<T>(dbName, collectionName)
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection
                     .Find(filter)
                     .Limit(1)
                     .FirstOrDefaultAsync();
@@ -363,6 +484,14 @@ namespace ShuseiCommon.Common.MDB
                 return result != null
                     ? Result<T>.Success(result)
                     : Result<T>.Fail($"Document with key {key} not found");
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<T>.Fail($"Find failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<T>.Fail($"Find failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -377,10 +506,19 @@ namespace ShuseiCommon.Common.MDB
         {
             try
             {
-                var result = await GetCollection<T>(dbName, collectionName)
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection
                     .Find(FilterDefinition<T>.Empty)
                     .ToListAsync();
                 return Result<List<T>>.Success(result);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<List<T>>.Fail($"Find failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<List<T>>.Fail($"Find failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -392,10 +530,19 @@ namespace ShuseiCommon.Common.MDB
         {
             try
             {
-                var result = await GetCollection<T>(dbName, collectionName)
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection
                     .Find(filter)
                     .ToListAsync();
                 return Result<List<T>>.Success(result);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<List<T>>.Fail($"Find failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<List<T>>.Fail($"Find failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -407,10 +554,19 @@ namespace ShuseiCommon.Common.MDB
         {
             try
             {
-                var result = await GetCollection<T>(dbName, collectionName)
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection
                     .Find(filter)
                     .ToListAsync();
                 return Result<List<T>>.Success(result);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<List<T>>.Fail($"Find failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<List<T>>.Fail($"Find failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -422,11 +578,20 @@ namespace ShuseiCommon.Common.MDB
         {
             try
             {
-                var result = await GetCollection<T>(dbName, collectionName)
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection
                     .Find(filter)
                     .Limit(1)
                     .FirstOrDefaultAsync();
                 return Result<T?>.Success(result);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<T?>.Fail($"FindOne failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<T?>.Fail($"FindOne failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -438,8 +603,17 @@ namespace ShuseiCommon.Common.MDB
         {
             try
             {
-                var count = await GetCollection<T>(dbName, collectionName).CountDocumentsAsync(filter);
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var count = await collection.CountDocumentsAsync(filter);
                 return Result<long>.Success(count);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<long>.Fail($"Count failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<long>.Fail($"Count failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -451,11 +625,20 @@ namespace ShuseiCommon.Common.MDB
         {
             try
             {
-                var exists = await GetCollection<T>(dbName, collectionName)
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var exists = await collection
                     .Find(filter)
                     .Limit(1)
                     .AnyAsync();
                 return Result<bool>.Success(exists);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<bool>.Fail($"Exists check failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<bool>.Fail($"Exists check failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -468,11 +651,20 @@ namespace ShuseiCommon.Common.MDB
             try
             {
                 var filter = BuildKeyFilter<T, TKey>(key);
-                var exists = await GetCollection<T>(dbName, collectionName)
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var exists = await collection
                     .Find(filter)
                     .Limit(1)
                     .AnyAsync();
                 return Result<bool>.Success(exists);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<bool>.Fail($"Exists check failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<bool>.Fail($"Exists check failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -496,7 +688,7 @@ namespace ShuseiCommon.Common.MDB
 
             try
             {
-                var collection = GetCollection<T>(dbName, collectionName);
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
                 var filterBuilder = Builders<T>.Filter;
                 var combinedFilter = filterBuilder.Where(filter);
 
@@ -533,6 +725,14 @@ namespace ShuseiCommon.Common.MDB
 
                 return new PageResult<List<T>>((int)countTask.Result, dataTask.Result);
             }
+            catch (MongoConnectionException ex)
+            {
+                return PageResult<List<T>>.Fail($"FindPage failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return PageResult<List<T>>.Fail($"FindPage failed: Timeout - {ex.Message}");
+            }
             catch (Exception ex)
             {
                 return PageResult<List<T>>.Fail($"FindPage failed: {ex.Message}");
@@ -550,7 +750,7 @@ namespace ShuseiCommon.Common.MDB
         {
             try
             {
-                var collection = GetCollection<T>(dbName, collectionName);
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
 
                 var countTask = collection.CountDocumentsAsync(filter);
                 var findFluent = collection.Find(filter);
@@ -568,6 +768,14 @@ namespace ShuseiCommon.Common.MDB
 
                 return new PageResult<List<T>>((int)countTask.Result, dataTask.Result);
             }
+            catch (MongoConnectionException ex)
+            {
+                return PageResult<List<T>>.Fail($"FindPage failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return PageResult<List<T>>.Fail($"FindPage failed: Timeout - {ex.Message}");
+            }
             catch (Exception ex)
             {
                 return PageResult<List<T>>.Fail($"FindPage failed: {ex.Message}");
@@ -583,10 +791,19 @@ namespace ShuseiCommon.Common.MDB
         {
             try
             {
-                var result = await GetCollection<T>(dbName, collectionName)
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection
                     .Aggregate(pipeline)
                     .ToListAsync();
                 return Result<List<TResult>>.Success(result);
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<List<TResult>>.Fail($"Aggregate failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<List<TResult>>.Fail($"Aggregate failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -603,9 +820,22 @@ namespace ShuseiCommon.Common.MDB
         {
             try
             {
-                var result = await GetCollection<T>(dbName, collectionName)
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection
                     .BulkWriteAsync(requests, new BulkWriteOptions { IsOrdered = false });
                 return Result<BulkWriteResult<T>>.Success(result);
+            }
+            catch (MongoBulkWriteException ex)
+            {
+                return Result<BulkWriteResult<T>>.Fail($"BulkWrite failed: {ex.WriteErrors.Count} errors - {ex.Message}");
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<BulkWriteResult<T>>.Fail($"BulkWrite failed: Connection error - {ex.Message}");
+            }
+            catch (TimeoutException ex)
+            {
+                return Result<BulkWriteResult<T>>.Fail($"BulkWrite failed: Timeout - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -627,10 +857,19 @@ namespace ShuseiCommon.Common.MDB
                 var requests = items.Select(item =>
                     new ReplaceOneModel<T>(filterSelector(item), item) { IsUpsert = true });
 
-                var result = await GetCollection<T>(dbName, collectionName)
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection
                     .BulkWriteAsync(requests, new BulkWriteOptions { IsOrdered = false });
 
                 return Result<int>.Success((int)(result.InsertedCount + result.ModifiedCount + result.Upserts.Count));
+            }
+            catch (MongoBulkWriteException ex)
+            {
+                return Result<int>.Fail($"BulkUpsert failed: {ex.WriteErrors.Count} errors - {ex.Message}");
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<int>.Fail($"BulkUpsert failed: Connection error - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -659,10 +898,19 @@ namespace ShuseiCommon.Common.MDB
                     return new ReplaceOneModel<T>(filter, item) { IsUpsert = true };
                 });
 
-                var result = await GetCollection<T>(dbName, collectionName)
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection
                     .BulkWriteAsync(requests, new BulkWriteOptions { IsOrdered = false });
 
                 return Result<int>.Success((int)(result.InsertedCount + result.ModifiedCount + result.Upserts.Count));
+            }
+            catch (MongoBulkWriteException ex)
+            {
+                return Result<int>.Fail($"BulkSave failed: {ex.WriteErrors.Count} errors - {ex.Message}");
+            }
+            catch (MongoConnectionException ex)
+            {
+                return Result<int>.Fail($"BulkSave failed: Connection error - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -688,8 +936,13 @@ namespace ShuseiCommon.Common.MDB
                 var options = new CreateIndexOptions { Background = true, Unique = unique };
                 var model = new CreateIndexModel<T>(keys, options);
 
-                var result = await GetCollection<T>(dbName, collectionName).Indexes.CreateOneAsync(model);
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection.Indexes.CreateOneAsync(model);
                 return Result<string>.Success(result);
+            }
+            catch (MongoCommandException ex)
+            {
+                return Result<string>.Fail($"CreateIndex failed: {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -708,8 +961,13 @@ namespace ShuseiCommon.Common.MDB
                 var options = new CreateIndexOptions { Background = true, Unique = unique };
                 var model = new CreateIndexModel<T>(keys, options);
 
-                var result = await GetCollection<T>(dbName, collectionName).Indexes.CreateOneAsync(model);
+                var collection = await GetCollectionAsync<T>(dbName, collectionName);
+                var result = await collection.Indexes.CreateOneAsync(model);
                 return Result<string>.Success(result);
+            }
+            catch (MongoCommandException ex)
+            {
+                return Result<string>.Fail($"CreateCompoundIndex failed: {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -719,15 +977,30 @@ namespace ShuseiCommon.Common.MDB
         #endregion
 
         #region Transaction
-        public async Task<Result<bool>> ExecuteInTransaction(Func<IClientSessionHandle, Task> action)
+        public Task<Result<bool>> ExecuteInTransaction(Func<IClientSessionHandle, Task> action)
+            => ExecuteInTransaction(action, null);
+
+        public async Task<Result<bool>> ExecuteInTransaction(
+            Func<IClientSessionHandle, Task> action,
+            TransactionOptions? options)
         {
             using var session = await Client.StartSessionAsync();
             try
             {
-                session.StartTransaction();
+                session.StartTransaction(options);
                 await action(session);
                 await session.CommitTransactionAsync();
                 return Result<bool>.Success(true);
+            }
+            catch (MongoConnectionException ex)
+            {
+                await session.AbortTransactionAsync();
+                return Result<bool>.Fail($"Transaction failed: Connection error - {ex.Message}");
+            }
+            catch (MongoCommandException ex)
+            {
+                await session.AbortTransactionAsync();
+                return Result<bool>.Fail($"Transaction failed: Command error - {ex.Message}");
             }
             catch (Exception ex)
             {
@@ -736,15 +1009,30 @@ namespace ShuseiCommon.Common.MDB
             }
         }
 
-        public async Task<Result<T>> ExecuteInTransaction<T>(Func<IClientSessionHandle, Task<T>> action)
+        public Task<Result<T>> ExecuteInTransaction<T>(Func<IClientSessionHandle, Task<T>> action)
+            => ExecuteInTransaction(action, null);
+
+        public async Task<Result<T>> ExecuteInTransaction<T>(
+            Func<IClientSessionHandle, Task<T>> action,
+            TransactionOptions? options)
         {
             using var session = await Client.StartSessionAsync();
             try
             {
-                session.StartTransaction();
+                session.StartTransaction(options);
                 var result = await action(session);
                 await session.CommitTransactionAsync();
                 return Result<T>.Success(result);
+            }
+            catch (MongoConnectionException ex)
+            {
+                await session.AbortTransactionAsync();
+                return Result<T>.Fail($"Transaction failed: Connection error - {ex.Message}");
+            }
+            catch (MongoCommandException ex)
+            {
+                await session.AbortTransactionAsync();
+                return Result<T>.Fail($"Transaction failed: Command error - {ex.Message}");
             }
             catch (Exception ex)
             {
